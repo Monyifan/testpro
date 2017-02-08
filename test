@@ -1,0 +1,186 @@
+# encoding: utf-8
+import SocketServer
+import multiprocessing
+from multiprocessing import freeze_support
+import os
+import decimal
+
+decimal.__version__
+
+from ctypes import *
+from pymodbus.transaction import *
+from pymodbus.factory import ServerDecoder
+from pymodbus.device import ModbusControlBlock
+from pymodbus.device import ModbusDeviceIdentification
+from pymodbus.server.sync import ModbusConnectedRequestHandler
+from pymodbus.datastore import ModbusServerContext
+from pymodbus.datastore import ModbusSlaveContext
+from pymodbus.datastore import ModbusSequentialDataBlock
+
+#---------------------------------------------------------------------------#
+# 日志文件配置
+#---------------------------------------------------------------------------#
+import logging
+
+log_file = "./FEPCON.log"
+log_level = logging.DEBUG
+
+logger = logging.getLogger("loggingmodule.NomalLogger")
+handler = logging.FileHandler(log_file)
+formatter = logging.Formatter("[%(levelname)s][%(funcName)s][%(asctime)s]%(message)s")
+
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+logger.setLevel(log_level)
+#---------------------------------------------------------------------------#
+# 数据库文件配置
+#---------------------------------------------------------------------------#
+fileload = os.getcwd()
+# ---------------------------------------------------------------------------#
+# ModbusTcpServer 重构
+# ---------------------------------------------------------------------------#
+
+class ModbusTcpServer(SocketServer.ThreadingTCPServer):
+
+    def __init__(self, context,address, framer=None, identity=None):
+
+        self.threads = []
+        self.decoder = ServerDecoder()
+        self.framer  = ModbusSocketFramer
+        self.context = context
+        self.control = ModbusControlBlock()
+        self.address = address
+
+        if isinstance(identity, ModbusDeviceIdentification):
+            self.control.Identity.update(identity)
+
+        SocketServer.ThreadingTCPServer.__init__(self,
+            self.address, ModbusConnectedRequestHandler)        #获取链接句柄
+
+    def process_request(self, request, client):
+
+       logger.info("Started thread to serve client at " + str(client))
+
+       SocketServer.ThreadingTCPServer.process_request(self, request, client)
+
+    def server_close(self):
+
+       logger.debug("Modbus server stopped")
+       self.socket.close()
+       for thread in self.threads:
+           thread.running = False
+
+# ---------------------------------------------------------------------------#
+# 进行对应DI点的修改
+# ---------------------------------------------------------------------------#
+def chantoDI(context,block):
+    DI_list = ['0']*16  #一个DI点上有16位
+    print("please input the first address:")
+    try :
+        total_addr = int(raw_input())
+        while True:
+            print("please input the second address:[0-15] or -1 to exit")
+            DI_addr = int(raw_input())
+            if DI_addr == -1:
+                break
+            print("please input the data:")
+            list_DI_val = raw_input()
+            if '0' == list_DI_val or '1' == list_DI_val:
+                DI_list[DI_addr] = list_DI_val
+            else :
+                print("wrong input!")
+    except:
+            print("something wrong!please cheak your input")
+            return
+    real_DI_list = DI_list[::-1]    #由于FEP的服务器为大端,要翻转大小端
+    list_str_val = ('').join(real_DI_list)
+    list_int_val = int(list_str_val, 2)
+    block.setValues(total_addr+2, list_int_val)
+# ---------------------------------------------------------------------------#
+#   进行对应AI点的修改
+# ---------------------------------------------------------------------------#
+
+def chantoAI(context,block):
+    try :
+        print("please input the address:")
+        total_addr = int(raw_input())
+        print("please input the data:")
+        list_int_val = int(raw_input())
+    except:
+        print("something wrong!please cheak your input")
+        return
+
+    block.setValues(total_addr+1, [list_int_val])
+
+def chantoAIF(context,block):
+    try :
+        print("please input the address:")
+        total_addr = int(raw_input())
+        print("please input the data:")
+        strtemp = raw_input()
+        if strtemp == 0:
+            return
+    except:
+        print("something wrong!please cheak your input")
+        return
+    dll = cdll.LoadLibrary(fileload + '/floattohex.dll')
+    float_result = dll.myFloatChange
+    float_result.restype = c_char_p
+    ret = float_result(strtemp)       #获得浮点数计算后的十六进制字符串
+
+    val1 = int(ret[0:4], 16)     #转换为int存入context
+    val2 = int(ret[4:], 16)
+
+    block.setValues(total_addr+1, val1)
+    block.setValues(total_addr+2, val2)
+
+def chantoQuit(connwork):
+    connwork.terminate() #结束进程,更新程序内存存储内容之后重新启动
+    connwork.join()
+
+# ---------------------------------------------------------------------------#
+# 开一个进程一直运行服务器
+# ---------------------------------------------------------------------------#
+def work(context, address):
+    server = ModbusTcpServer(context, address)
+    server.serve_forever()
+
+# ---------------------------------------------------------------------------#
+# 程序主进程
+# ---------------------------------------------------------------------------#
+
+def main():
+    print("please input the IP:")            #获得本机IP
+    startip = raw_input()
+    address =(startip, 30010)
+    print address
+    block = ModbusSequentialDataBlock(1, [0]*10000)
+    while True:
+        slaves = ModbusSlaveContext(di = block, co = block, hr = block, ir = block)
+        context = ModbusServerContext(slaves = slaves, single = True)
+        connwork = multiprocessing.Process(target=work, args=(context, address))  #开启子进程
+        connwork.start()            #启动程序默认全部为0
+       # work(context, address)
+        print("--------------------")
+        print("please input the type:")       #1改变整数 2改变浮点数
+        print("1--DI")
+        print("2--AI")
+        print("3--AIF")
+        print("4--Quit")
+        print("--------------------")
+        input_val = int(raw_input())
+        if input_val == 1:
+           chantoDI(context,block)
+        elif input_val == 2:
+           chantoAI(context,block)
+        elif input_val == 3:
+           chantoAIF(context,block)
+        elif input_val == 4:
+           chantoQuit(connwork)
+           break
+        connwork.terminate() #结束进程,更新程序内存存储内容之后重新启动
+        connwork.join()
+    print("stop")
+if __name__ == '__main__':
+    freeze_support()
+    main()
